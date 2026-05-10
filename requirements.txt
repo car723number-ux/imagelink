@@ -1,10 +1,6 @@
 streamlit
-pandas
+networkx
+pyvis
 numpy
-plotly
+pandas
 yfinance
-scipy
-scikit-learn
-requests
-matplotlib
-pytz
