@@ -1,80 +1,85 @@
 import os
-import subprocess
-import sys
-
-# =================================================================
-# 1. 必要なライブラリの自動インストール
-# =================================================================
-def manage_libraries():
-    required = ["streamlit", "networkx", "pyvis", "sentence-transformers", "torch"]
-    for lib in required:
-        try:
-            __import__(lib)
-        except ImportError:
-            print(f"ライブラリ '{lib}' をインストール中...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
-
-manage_libraries()
-
+import urllib.request
+import zipfile
 import numpy as np
 import networkx as nx
 import streamlit as st
 import streamlit.components.v1 as components
 from pyvis.network import Network
-from sentence_transformers import SentenceTransformer, util
 
-# =================================================================
-# 2. Sentence-BERT（MiniLM）モデルをロード
-# =================================================================
-@st.cache_resource(show_spinner="軽量日本語モデルを読み込んでいます…")
-def load_model():
-    return SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+# ============================================================
+# 1. 軽量 word2vec モデルを自動ダウンロード（初回のみ）
+# ============================================================
 
-model = load_model()
+MODEL_URL = "https://dl.fbaipublicfiles.com/fasttext/vectors-wiki/wiki.ja.vec"
+MODEL_PATH = "wiki.ja.vec"
+TOP_N = 10
 
-# 保存しておく単語リスト（jawiki が無い代わりに語彙を自由に定義）
-# → 必要ならここを外部ファイルにしてもOK
-VOCAB = [
-    "半導体", "AI", "自動車", "銀行", "経済", "株式", "金融", "エネルギー", "資源",
-    "ネットワーク", "ソフトウェア", "製造業", "精密機器", "ロボット", "宇宙",
-    "物流", "電子部品", "電気", "スマホ", "インフラ", "データセンター"
-]
+@st.cache_resource(show_spinner="モデルを読み込んでいます（初回数秒）...")
+def download_and_load_model():
 
-# 事前に全単語をベクトル化
-@st.cache_resource(show_spinner="語彙のベクトル化中…")
-def encode_vocab(vocab):
-    vectors = model.encode(vocab, convert_to_tensor=True)
-    return vocab, vectors
+    # モデルがなければダウンロード
+    if not os.path.exists(MODEL_PATH):
+        st.info("日本語軽量 word2vec モデルをダウンロード中...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
 
-words, vectors = encode_vocab(VOCAB)
+    words = []
+    vectors = []
+
+    with open(MODEL_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            parts = line.rstrip().split(' ')
+            if len(parts) < 300:
+                continue
+            word = parts[0]
+            try:
+                vec = np.array(parts[1:], dtype=np.float32)
+            except:
+                continue
+            words.append(word)
+            vectors.append(vec)
+
+    vectors = np.array(vectors, dtype=np.float32)
+    word2idx = {w: i for i, w in enumerate(words)}
+    return words, vectors, word2idx
 
 
-# =================================================================
-# 3. 類似単語検索（Sentence-BERT版）
-# =================================================================
-def most_similar(word, words, vectors, topn=10):
-    if word not in words:
-        raise KeyError(f"'{word}' は語彙リストにありません。")
+# ============================================================
+# 2. 類似語計算
+# ============================================================
 
-    idx = words.index(word)
+def most_similar(word, words, vectors, word2idx, topn=10):
+    if word not in word2idx:
+        return []
+
+    idx = word2idx[word]
     vec = vectors[idx]
 
-    sims = util.cos_sim(vec, vectors)[0].cpu().numpy()
-    sims[idx] = -1  # 自分自身を除外
+    norms = np.linalg.norm(vectors, axis=1)
+    norms[norms == 0] = 1e-10
+    vec_norm = np.linalg.norm(vec)
+    if vec_norm == 0:
+        vec_norm = 1e-10
 
-    top_indices = sims.argsort()[::-1][:topn]
+    sims = (vectors @ vec) / (norms * vec_norm)
+    sims[idx] = -1
+
+    top_indices = np.argpartition(sims, -topn)[-topn:]
+    top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
 
     return [(words[i], float(sims[i])) for i in top_indices]
 
 
-# =================================================================
-# 4. ネットワーク作成
-# =================================================================
-def build_network_html(start_word, words, vectors, branch_counts):
+# ============================================================
+# 3. PyVis ネットワーク生成
+# ============================================================
+
+def build_network_html(start_word, words, vectors, word2idx, branch_counts):
     G = nx.Graph()
     queue = [(start_word, 0)]
-    G.add_node(start_word, size=45, title="起点", color="#FF4500", label=start_word)
     visited = {start_word}
+
+    G.add_node(start_word, size=45, color="#FF4500", title="起点", label=start_word)
 
     while queue:
         current_word, depth = queue.pop(0)
@@ -82,62 +87,67 @@ def build_network_html(start_word, words, vectors, branch_counts):
             continue
 
         n_branch = branch_counts[depth]
-        similar_words = most_similar(current_word, words, vectors, topn=n_branch + 5)
+        similar_words = most_similar(current_word, words, vectors, word2idx, topn=n_branch + 5)
 
         count = 0
-        for w, score in similar_words:
+        for word, score in similar_words:
             if count >= n_branch:
                 break
-            if w in visited or len(w) < 1:
+            if word in visited or len(word) < 2:
                 continue
 
             node_colors = ["#FFD700", "#87CEEB", "#32CD32"]
             node_sizes = [35, 25, 15]
 
-            G.add_node(w, size=node_sizes[depth], color=node_colors[depth],
-                       title=f"関連度: {score:.3f}", label=w)
-            G.add_edge(current_word, w, value=score)
+            G.add_node(word,
+                       size=node_sizes[depth],
+                       color=node_colors[depth],
+                       title=f"関連度: {score:.3f}",
+                       label=word)
+            G.add_edge(current_word, word, value=score)
 
-            visited.add(w)
-            queue.append((w, depth + 1))
+            visited.add(word)
+            queue.append((word, depth + 1))
             count += 1
 
+    # PyVis に変換
     net = Network(height="750px", width="100%", bgcolor="#1a1a1a", font_color="white")
     net.from_nx(G)
     net.toggle_physics(True)
 
-    html_path = "investment_map.html"
+    html_path = "wordmap.html"
     net.write_html(html_path)
-    with open(html_path, 'r', encoding='utf-8') as f:
+    with open(html_path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-# =================================================================
-# 5. Streamlit UI
-# =================================================================
-st.set_page_config(page_title="連想マップ", layout="wide")
-st.title("📈 連想ワードマップ（軽量版）")
+# ============================================================
+# 4. Streamlit UI
+# ============================================================
+
+st.set_page_config(page_title="連想ワードマップ", layout="wide")
+st.title("🔍 連想ワードマップ（軽量・高速版）")
+
+words, vectors, word2idx = download_and_load_model()
 
 with st.sidebar:
     st.header("⚙️ 設定")
     start_word = st.text_input("起点ワード", value="半導体")
 
     st.markdown("---")
-    st.markdown("**階層ごとの表示数**")
-    b1 = st.slider("1階層目", 1, 10, 5)
-    b2 = st.slider("2階層目", 1, 10, 3)
-    b3 = st.slider("3階層目", 1, 5, 1)
+    b1 = st.slider("1階層目の表示数", 1, 10, 5)
+    b2 = st.slider("2階層目の表示数", 1, 10, 3)
+    b3 = st.slider("3階層目の表示数", 1, 5, 1)
 
-    run = st.button("🔍 マップを生成", use_container_width=True)
+    run = st.button("🚀 マップ生成", use_container_width=True)
 
-# 入力語が語彙リストにあるか判定
 if run:
-    if start_word not in words:
-        st.error("この単語は語彙リストにありません。\nVOCAB に追加してください。")
+    if start_word not in word2idx:
+        st.error("単語が語彙にありません。別のワードで試してください。")
     else:
-        with st.spinner(f"「{start_word}」のネットワークを構築中..."):
-            html = build_network_html(start_word, words, vectors, [b1, b2, b3])
-        st.success("完成！")
+        with st.spinner("ネットワーク構築中..."):
+            html = build_network_html(start_word, words, vectors, word2idx, [b1, b2, b3])
+        st.success("完了！")
         components.html(html, height=770, scrolling=False)
 else:
-    st.info("左のサイドバーに起点ワードを入力して「マップを生成」を押してください。")
+    st.info("左の起点ワードを入力して「マップ生成」を押してください。")
