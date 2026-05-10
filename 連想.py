@@ -3,10 +3,10 @@ import subprocess
 import sys
 
 # =================================================================
-# 1. 必要なライブラリの自動チェック・インストール
+# 1. 必要なライブラリの自動インストール
 # =================================================================
 def manage_libraries():
-    required = ["streamlit", "networkx", "pyvis"]
+    required = ["streamlit", "networkx", "pyvis", "sentence-transformers", "torch"]
     for lib in required:
         try:
             __import__(lib)
@@ -14,78 +14,63 @@ def manage_libraries():
             print(f"ライブラリ '{lib}' をインストール中...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
 
+manage_libraries()
+
 import numpy as np
 import networkx as nx
 import streamlit as st
 import streamlit.components.v1 as components
 from pyvis.network import Network
+from sentence_transformers import SentenceTransformer, util
 
 # =================================================================
-# 2. 設定
+# 2. Sentence-BERT（MiniLM）モデルをロード
 # =================================================================
-MODEL_PATH = 'jawiki.word_vectors.300d.txt'
-BRANCH_COUNTS = [5, 3, 1]
+@st.cache_resource(show_spinner="軽量日本語モデルを読み込んでいます…")
+def load_model():
+    return SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+model = load_model()
+
+# 保存しておく単語リスト（jawiki が無い代わりに語彙を自由に定義）
+# → 必要ならここを外部ファイルにしてもOK
+VOCAB = [
+    "半導体", "AI", "自動車", "銀行", "経済", "株式", "金融", "エネルギー", "資源",
+    "ネットワーク", "ソフトウェア", "製造業", "精密機器", "ロボット", "宇宙",
+    "物流", "電子部品", "電気", "スマホ", "インフラ", "データセンター"
+]
+
+# 事前に全単語をベクトル化
+@st.cache_resource(show_spinner="語彙のベクトル化中…")
+def encode_vocab(vocab):
+    vectors = model.encode(vocab, convert_to_tensor=True)
+    return vocab, vectors
+
+words, vectors = encode_vocab(VOCAB)
+
 
 # =================================================================
-# 3. word2vecテキスト形式を直接読み込む（起動時に1回だけ）
+# 3. 類似単語検索（Sentence-BERT版）
 # =================================================================
-@st.cache_resource(show_spinner="単語ベクトルを読み込んでいます（初回のみ1〜3分かかります）...")
-def load_word_vectors(path):
-    words = []
-    vectors = []
+def most_similar(word, words, vectors, topn=10):
+    if word not in words:
+        raise KeyError(f"'{word}' は語彙リストにありません。")
 
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        first_line = f.readline().strip().split()
-
-        if len(first_line) == 2 and first_line[0].isdigit():
-            pass
-        else:
-            word = first_line[0]
-            vec = np.array(first_line[1:], dtype=np.float32)
-            if len(vec) > 0:
-                words.append(word)
-                vectors.append(vec)
-
-        for line in f:
-            parts = line.rstrip().split(' ')
-            if len(parts) < 2:
-                continue
-            word = parts[0]
-            try:
-                vec = np.array(parts[1:], dtype=np.float32)
-                words.append(word)
-                vectors.append(vec)
-            except ValueError:
-                continue
-
-    vectors = np.array(vectors, dtype=np.float32)
-    word2idx = {w: i for i, w in enumerate(words)}
-    return words, vectors, word2idx
-
-
-def most_similar(word, words, vectors, word2idx, topn=10):
-    if word not in word2idx:
-        raise KeyError(f"'{word}' は語彙にありません")
-
-    idx = word2idx[word]
+    idx = words.index(word)
     vec = vectors[idx]
 
-    norms = np.linalg.norm(vectors, axis=1)
-    norms[norms == 0] = 1e-10
-    vec_norm = np.linalg.norm(vec)
-    if vec_norm == 0:
-        vec_norm = 1e-10
+    sims = util.cos_sim(vec, vectors)[0].cpu().numpy()
+    sims[idx] = -1  # 自分自身を除外
 
-    sims = (vectors @ vec) / (norms * vec_norm)
-    sims[idx] = -1
-
-    top_indices = np.argpartition(sims, -topn)[-topn:]
-    top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+    top_indices = sims.argsort()[::-1][:topn]
 
     return [(words[i], float(sims[i])) for i in top_indices]
 
 
-def build_network_html(start_word, words, vectors, word2idx, branch_counts):
+# =================================================================
+# 4. ネットワーク作成
+# =================================================================
+def build_network_html(start_word, words, vectors, branch_counts):
     G = nx.Graph()
     queue = [(start_word, 0)]
     G.add_node(start_word, size=45, title="起点", color="#FF4500", label=start_word)
@@ -96,29 +81,26 @@ def build_network_html(start_word, words, vectors, word2idx, branch_counts):
         if depth >= len(branch_counts):
             continue
 
-        try:
-            n_branch = branch_counts[depth]
-            similar_words = most_similar(current_word, words, vectors, word2idx, topn=n_branch + 5)
+        n_branch = branch_counts[depth]
+        similar_words = most_similar(current_word, words, vectors, topn=n_branch + 5)
 
-            count = 0
-            for word, score in similar_words:
-                if count >= n_branch:
-                    break
-                if "[" in word or "Category:" in word or word in visited or len(word) < 2:
-                    continue
+        count = 0
+        for w, score in similar_words:
+            if count >= n_branch:
+                break
+            if w in visited or len(w) < 1:
+                continue
 
-                node_colors = ["#FFD700", "#87CEEB", "#32CD32"]
-                node_sizes = [35, 25, 15]
+            node_colors = ["#FFD700", "#87CEEB", "#32CD32"]
+            node_sizes = [35, 25, 15]
 
-                G.add_node(word, size=node_sizes[depth], color=node_colors[depth],
-                           title=f"関連度: {score:.3f}", label=word)
-                G.add_edge(current_word, word, value=score)
+            G.add_node(w, size=node_sizes[depth], color=node_colors[depth],
+                       title=f"関連度: {score:.3f}", label=w)
+            G.add_edge(current_word, w, value=score)
 
-                visited.add(word)
-                queue.append((word, depth + 1))
-                count += 1
-        except KeyError:
-            continue
+            visited.add(w)
+            queue.append((w, depth + 1))
+            count += 1
 
     net = Network(height="750px", width="100%", bgcolor="#1a1a1a", font_color="white")
     net.from_nx(G)
@@ -131,37 +113,30 @@ def build_network_html(start_word, words, vectors, word2idx, branch_counts):
 
 
 # =================================================================
-# 4. Streamlit UI
+# 5. Streamlit UI
 # =================================================================
 st.set_page_config(page_title="連想マップ", layout="wide")
-st.title("📈 連想ワードマップ")
-
-if not os.path.exists(MODEL_PATH):
-    st.error(f"「{MODEL_PATH}」が見つかりません。このスクリプトと同じフォルダに置いてください。")
-    st.stop()
-
-words, vectors, word2idx = load_word_vectors(MODEL_PATH)
+st.title("📈 連想ワードマップ（軽量版）")
 
 with st.sidebar:
     st.header("⚙️ 設定")
-    start_word = st.text_input("起点ワード", value="半導体", placeholder="例：AI、銀行、自動車")
+    start_word = st.text_input("起点ワード", value="半導体")
 
     st.markdown("---")
     st.markdown("**階層ごとの表示数**")
     b1 = st.slider("1階層目", 1, 10, 5)
     b2 = st.slider("2階層目", 1, 10, 3)
-    b3 = st.slider("3階層目", 1,  5, 1)
+    b3 = st.slider("3階層目", 1, 5, 1)
 
     run = st.button("🔍 マップを生成", use_container_width=True)
 
+# 入力語が語彙リストにあるか判定
 if run:
-    if not start_word.strip():
-        st.warning("起点ワードを入力してください。")
-    elif start_word.strip() not in word2idx:
-        st.error(f"「{start_word}」は語彙にありません。別のワードを試してください。")
+    if start_word not in words:
+        st.error("この単語は語彙リストにありません。\nVOCAB に追加してください。")
     else:
         with st.spinner(f"「{start_word}」のネットワークを構築中..."):
-            html = build_network_html(start_word.strip(), words, vectors, word2idx, [b1, b2, b3])
+            html = build_network_html(start_word, words, vectors, [b1, b2, b3])
         st.success("完成！")
         components.html(html, height=770, scrolling=False)
 else:
