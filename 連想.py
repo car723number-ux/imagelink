@@ -14,8 +14,6 @@ def manage_libraries():
             print(f"ライブラリ '{lib}' をインストール中...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
 
-manage_libraries()
-
 import numpy as np
 import networkx as nx
 import streamlit as st
